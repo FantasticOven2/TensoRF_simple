@@ -1,5 +1,7 @@
 import os
 import json
+from PIL import Image
+from tqdm import tqdm
 
 from torch.utils.data import Dataset
 from torchvision import transforms as T
@@ -27,10 +29,17 @@ class BlenderDataset(Dataset):
         self.scene_bbox = torch.tensor([[-1.5, -1.5, -1.5], [1.5, 1.5, 1.5]])
         self.blender2opencv = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 0, 1]])
         
-        #TODO: Implement this two functions 
         self.read_meta()
         self.define_proj_mat()
 
+        self.white_bg = True
+        self.near_far = [2.0, 6.0]
+
+        self.center = torch.mean(self.scene_bbox, axis=0).float().view(1, 1, 3)
+        self.radius = (self.scene_bbox[1] - self.center).float().view(1, 1, 3)
+        self.downsample = downsample
+    
+    
     #TODO: functionality??
     def read_meta(self):
         
@@ -67,8 +76,33 @@ class BlenderDataset(Dataset):
             self.poses += [c2w]
 
             image_path = os.path.join(self.root_dir, f"{frame['file_path']}.png")
-            
+            self.image_paths += [image_path]
+            img = Image.open(image_path)
+
+            if self.downsample != 1.0:
+                img = img.resize(self.img_wh, Image.LANCZOS)
+            img = self.transform(img) #(4, h, w)
+            img = img.view(4, -1).permute(1, 0) #(h*w, 4) RGBA
+            img = img[:, :3] * img[:, -1:] + (1 - img[:, -1:]) # blend A to RGB
+            self.all_rgbs += [img]
+
+            rays_o, rays_d = get_rays(self.directions, c2w) # both (h*w, 3)
+            self.all_rays += [torch.cat([rays_o, rays_d], 1)] # (h*w, 6)
+
+        self.poses = torch.stack(self.poses)
+        if not self.is_stack:
+            self.all_rays = torch.cat(self.all_rays, 0) #(len(self.meta['frames])*h*w, 3)
+            self.all_rgbs = torch.cat(self.all_rgbs, 0) #(len(self.meta['frames])*h*w, 3)
+        else:
+            self.all_rays = torch.stack(self.all_rays, 0) #(len(self.meta['frames]), h*w, 3)
+            self.all_rgbs = torch.stack(self.all_rgbs, 0).reshape(-1, *self.img_wh[::-1], 3) #(len(self.meta['frames]), h, w, 3)
+          
+
 
     #TODO: Do we really need this function?
     def define_transforms(self):
         self.transform = T.ToTensor()
+    
+    def define_proj_mat(self):
+        self.proj_mat = self.intrinsics.unsqueeze(0) @ torch.inverse(self.poses)[:, :3]
+
